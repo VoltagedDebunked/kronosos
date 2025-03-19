@@ -16,6 +16,7 @@
 #include <drivers/ata/ata.h>
 #include <core/exec/scheduler.h>
 #include <fs/ext2.h>
+#include <core/exec/syscalls.h>
 
 __attribute__((used, section(".limine_requests")))
 static volatile LIMINE_BASE_REVISION(3);
@@ -87,6 +88,8 @@ void kmain(void) {
     ata_init();
 
     ext2_init();
+
+    syscalls_init();
 
     scheduler_init();
 

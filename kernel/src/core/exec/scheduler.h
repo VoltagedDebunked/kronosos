@@ -38,7 +38,6 @@ typedef struct {
     uint64_t cr3; // Page table base
 } cpu_context_t;
 
-// Task control block structure
 typedef struct task {
     uint32_t tid;                      // Task ID
     char name[32];                     // Task name
@@ -55,6 +54,10 @@ typedef struct task {
     uintptr_t page_table;              // Page table (CR3 value)
     void* stack_top;                   // Top of the task's stack
     size_t stack_size;                 // Size of the task's stack
+    
+    int argc;                          // Number of arguments
+    char** argv;                       // Argument vector
+    char** envp;                       // Environment variables
     
     struct task* next;                 // Next task in queue
     struct task* prev;                 // Previous task in queue
@@ -106,9 +109,8 @@ static inline void spinlock_release(spinlock_t* lock) {
 
 // Scheduler functions
 bool scheduler_init(void);
-bool scheduler_scheduler_init(void);
 bool scheduler_register_kernel_idle(void);
-uint32_t scheduler_create_task(const void* elf_data, size_t elf_size, const char* name, task_priority_t priority);
+uint32_t scheduler_create_task(const void* elf_data, size_t elf_size, const char* name, task_priority_t priority, int argc, char* argv[], char* envp[]);
 bool scheduler_execute_task(uint32_t tid, int argc, char* argv[], char* envp[]);
 bool scheduler_terminate_task(uint32_t tid, int exit_code);
 task_t* scheduler_get_current_task(void);

@@ -28,6 +28,9 @@ static scheduler_stats_t scheduler_stats = {0};
 
 void schedule_next();
 void add_to_ready_queue(task_t* task);
+void free_task_resources(task_t* task);
+void remove_from_blocked_queue(task_t* task);
+void context_switch(task_t* next);
 
 // Scheduler configuration
 static scheduler_config_t scheduler_config = {
@@ -38,6 +41,10 @@ static scheduler_config_t scheduler_config = {
     .kernel_stack_size = 16384,
     .user_stack_size = 65536
 };
+
+task_t* scheduler_get_current_task(void) {
+    return current_task;
+}
 
 // Timer callback for preemptive scheduling
 static void timer_callback(uint64_t tick_count) {
@@ -69,6 +76,63 @@ static void timer_callback(uint64_t tick_count) {
         // No current task or task is not running, schedule next
         schedule_next();
     }
+}
+
+// Helper Functions (submodule: extra)
+
+void add_to_ready_queue(task_t* task) {
+    if (!task) return;
+
+    task->next = NULL;
+
+    if (!ready_queue_head) {
+        // Queue is empty
+        ready_queue_head = task;
+        ready_queue_tail = task;
+        task->prev = NULL;
+    } else {
+        // Add to the end of the queue
+        ready_queue_tail->next = task;
+        task->prev = ready_queue_tail;
+        ready_queue_tail = task;
+    }
+
+    task->state = TASK_STATE_READY;
+}
+
+void remove_from_ready_queue(task_t* task) {
+    if (!task) return;
+
+    if (task == ready_queue_head) {
+        // Task is at the head of the queue
+        ready_queue_head = task->next;
+        if (ready_queue_head) {
+            ready_queue_head->prev = NULL;
+        } else {
+            // Queue is now empty
+            ready_queue_tail = NULL;
+        }
+    } else if (task == ready_queue_tail) {
+        // Task is at the tail of the queue
+        ready_queue_tail = task->prev;
+        if (ready_queue_tail) {
+            ready_queue_tail->next = NULL;
+        } else {
+            // Queue is now empty
+            ready_queue_head = NULL;
+        }
+    } else {
+        // Task is in the middle of the queue
+        if (task->prev) {
+            task->prev->next = task->next;
+        }
+        if (task->next) {
+            task->next->prev = task->prev;
+        }
+    }
+
+    task->next = NULL;
+    task->prev = NULL;
 }
 
 // Initialize the scheduler
@@ -196,14 +260,13 @@ static void* create_task_stack(size_t stack_size, uintptr_t page_table) {
 }
 
 // Initialize a task's CPU context
-static void init_task_context(task_t* task, uint64_t entry, uint64_t stack) {
+static void init_task_context(task_t* task, uint64_t entry_point, uint64_t stack_top, int argc, char* argv[], char* envp[]) {
     // Clear the context
     memset(&task->context, 0, sizeof(task->context));
 
     // Set up the initial CPU context for the task
-    task->context.rip = entry;
-    task->context.rsp = stack;
-    task->context.rflags = 0x202; // IF flag set (interrupts enabled)
+    task->context.rip = entry_point; // Entry point of the program
+    task->context.rflags = 0x202;    // Interrupts enabled
 
     // Set up segment registers for user mode
     task->context.cs = 0x1B | 3; // User code segment with RPL=3
@@ -215,64 +278,226 @@ static void init_task_context(task_t* task, uint64_t entry, uint64_t stack) {
 
     // Set page table
     task->context.cr3 = task->page_table;
-}
 
-// Add a task to the ready queue
-void add_to_ready_queue(task_t* task) {
-    if (!task) return;
+    // Set up the stack for the Linux ABI
+    uint64_t* stack = (uint64_t*)stack_top;
 
-    // Initialize links
-    task->next = NULL;
-
-    if (!ready_queue_head) {
-        // Queue is empty
-        ready_queue_head = task;
-        ready_queue_tail = task;
-        task->prev = NULL;
-    } else {
-        // Add to end of queue
-        ready_queue_tail->next = task;
-        task->prev = ready_queue_tail;
-        ready_queue_tail = task;
+    // Calculate the number of environment variables
+    int envc = 0;
+    while (envp[envc] != NULL) {
+        envc++;
     }
 
-    task->state = TASK_STATE_READY;
+    // Calculate the total size needed for argv and envp strings
+    size_t argv_size = 0;
+    for (int i = 0; i < argc; i++) {
+        argv_size += strlen(argv[i]) + 1;
+    }
+
+    size_t envp_size = 0;
+    for (int i = 0; i < envc; i++) {
+        envp_size += strlen(envp[i]) + 1;
+    }
+
+    // Align the stack to 16 bytes (Linux ABI requirement)
+    uint64_t stack_ptr = (uint64_t)stack_top - (argc + envc + 2) * sizeof(uint64_t) - argv_size - envp_size;
+    stack_ptr &= ~0xF;
+
+    // Place argv and envp strings on the stack
+    char* string_base = (char*)stack_ptr;
+    char* string_ptr = string_base;
+
+    // Copy argv strings
+    for (int i = 0; i < argc; i++) {
+        strcpy(string_ptr, argv[i]);
+        argv[i] = string_ptr; // Update argv pointers to the new stack location
+        string_ptr += strlen(argv[i]) + 1;
+    }
+
+    // Copy envp strings
+    for (int i = 0; i < envc; i++) {
+        strcpy(string_ptr, envp[i]);
+        envp[i] = string_ptr; // Update envp pointers to the new stack location
+        string_ptr += strlen(envp[i]) + 1;
+    }
+
+    // Place argv and envp pointers on the stack
+    uint64_t* stack_ptr_u64 = (uint64_t*)stack_ptr;
+
+    // argv array
+    for (int i = 0; i < argc; i++) {
+        *stack_ptr_u64++ = (uint64_t)argv[i];
+    }
+    *stack_ptr_u64++ = 0; // NULL-terminate argv
+
+    // envp array
+    for (int i = 0; i < envc; i++) {
+        *stack_ptr_u64++ = (uint64_t)envp[i];
+    }
+    *stack_ptr_u64++ = 0; // NULL-terminate envp
+
+    // Auxiliary vectors (empty for now)
+    *stack_ptr_u64++ = 0; // AT_NULL
+    *stack_ptr_u64++ = 0;
+
+    // Set argc
+    *stack_ptr_u64++ = argc;
+
+    // Set the stack pointer in the task's context
+    task->context.rsp = (uint64_t)stack_ptr_u64;
 }
 
-// Remove a task from the ready queue
-static void remove_from_ready_queue(task_t* task) {
-    if (!task) return;
+uint32_t scheduler_create_task(const void* elf_data, size_t elf_size, const char* name, task_priority_t priority, int argc, char* argv[], char* envp[]) {
+    spinlock_acquire(&task_lock);
 
-    if (task == ready_queue_head) {
-        // Task is at head of queue
-        ready_queue_head = task->next;
-        if (ready_queue_head) {
-            ready_queue_head->prev = NULL;
-        } else {
-            // Queue is now empty
-            ready_queue_tail = NULL;
-        }
-    } else if (task == ready_queue_tail) {
-        // Task is at tail of queue
-        ready_queue_tail = task->prev;
-        if (ready_queue_tail) {
-            ready_queue_tail->next = NULL;
-        } else {
-            // Queue is now empty
-            ready_queue_head = NULL;
-        }
-    } else {
-        // Task is in middle of queue
-        if (task->prev) {
-            task->prev->next = task->next;
-        }
-        if (task->next) {
-            task->next->prev = task->prev;
+    // Find a free slot in the task table
+    task_t* task = NULL;
+    for (int i = 0; i < TASK_MAX_COUNT; i++) {
+        if (task_table[i].state == TASK_STATE_TERMINATED || task_table[i].state == TASK_STATE_NEW) {
+            task = &task_table[i];
+            break;
         }
     }
 
-    task->next = NULL;
-    task->prev = NULL;
+    if (!task) {
+        spinlock_release(&task_lock);
+        LOG_ERROR("No free task slots available");
+        return 0;
+    }
+
+    // Initialize the task structure
+    memset(task, 0, sizeof(task_t));
+    task->tid = allocate_tid();
+    task->state = TASK_STATE_NEW;
+    task->base_priority = priority;
+    task->dynamic_priority = priority;
+    task->quantum = scheduler_config.default_time_quantum;
+    task->start_time = scheduler_stats.ticks_since_boot;
+    strncpy(task->name, name, sizeof(task->name) - 1);
+
+    // Create a new address space for the task
+    task->page_table = create_task_address_space();
+    if (!task->page_table) {
+        spinlock_release(&task_lock);
+        LOG_ERROR("Failed to create address space for task %u", task->tid);
+        return 0;
+    }
+
+    // Create a stack for the task
+    task->stack_size = scheduler_config.user_stack_size;
+    task->stack_top = create_task_stack(task->stack_size, task->page_table);
+    if (!task->stack_top) {
+        vmm_delete_address_space(task->page_table);
+        spinlock_release(&task_lock);
+        LOG_ERROR("Failed to create stack for task %u", task->tid);
+        return 0;
+    }
+
+    // Load the ELF binary into the task's address space
+    uint64_t entry_point;
+    if (!elf_load(elf_data, elf_size)) {
+        free_task_resources(task);
+        spinlock_release(&task_lock);
+        LOG_ERROR("Failed to load ELF for task %u", task->tid);
+        return 0;
+    }
+
+    // Initialize the task's context with proper stack setup for argv and envp
+    init_task_context(task, entry_point, (uint64_t)task->stack_top, argc, argv, envp);
+
+    // Add the task to the ready queue
+    add_to_ready_queue(task);
+
+    // Update scheduler statistics
+    scheduler_stats.total_tasks_created++;
+    scheduler_stats.current_task_count++;
+
+    spinlock_release(&task_lock);
+
+    LOG_DEBUG("Created task %u: %s", task->tid, task->name);
+    return task->tid;
+}
+
+bool scheduler_execute_task(uint32_t tid, int argc, char* argv[], char* envp[]) {
+    spinlock_acquire(&task_lock);
+
+    task_t* task = scheduler_get_task_by_id(tid);
+    if (!task || task->state != TASK_STATE_READY) {
+        spinlock_release(&task_lock);
+        LOG_ERROR("Task %u is not ready to execute", tid);
+        return false;
+    }
+
+    // Update the task's argc, argv, and envp
+    task->argc = argc;
+    task->argv = argv;
+    task->envp = envp;
+
+    // Switch to the task's context
+    context_switch(task);
+
+    spinlock_release(&task_lock);
+    return true;
+}
+
+void scheduler_yield(void) {
+    spinlock_acquire(&task_lock);
+
+    if (current_task && current_task->state == TASK_STATE_RUNNING) {
+        current_task->state = TASK_STATE_READY;
+        add_to_ready_queue(current_task);
+    }
+
+    schedule_next();
+
+    spinlock_release(&task_lock);
+}
+
+bool scheduler_terminate_task(uint32_t tid, int exit_code) {
+    spinlock_acquire(&task_lock);
+
+    task_t* task = scheduler_get_task_by_id(tid);
+    if (!task || task->state == TASK_STATE_TERMINATED) {
+        spinlock_release(&task_lock);
+        LOG_ERROR("Task %u is already terminated or does not exist", tid);
+        return false;
+    }
+
+    // Set the task's state to terminated
+    task->state = TASK_STATE_TERMINATED;
+    task->exit_code = exit_code;
+
+    // Remove the task from any queues
+    if (task->state == TASK_STATE_READY) {
+        remove_from_ready_queue(task);
+    } else if (task->state == TASK_STATE_BLOCKED) {
+        remove_from_blocked_queue(task);
+    }
+
+    // Free the task's resources
+    free_task_resources(task);
+
+    // Update scheduler statistics
+    scheduler_stats.current_task_count--;
+
+    spinlock_release(&task_lock);
+
+    LOG_DEBUG("Terminated task %u with exit code %d", tid, exit_code);
+    return true;
+}
+
+task_t* scheduler_get_task_by_id(uint32_t tid) {
+    spinlock_acquire(&task_lock); // Protect the task table
+
+    for (int i = 0; i < TASK_MAX_COUNT; i++) {
+        if (task_table[i].tid == tid) {
+            spinlock_release(&task_lock);
+            return &task_table[i]; // Return the task if found
+        }
+    }
+
+    spinlock_release(&task_lock);
+    return NULL; // Task not found
 }
 
 // Add a task to the blocked queue
@@ -287,7 +512,7 @@ static void add_to_blocked_queue(task_t* task) {
 }
 
 // Remove a task from the blocked queue
-static void remove_from_blocked_queue(task_t* task) {
+void remove_from_blocked_queue(task_t* task) {
     if (!task) return;
 
     task_t* current = blocked_queue_head;
@@ -310,7 +535,7 @@ static void remove_from_blocked_queue(task_t* task) {
 }
 
 // Free task resources
-static void free_task_resources(task_t* task) {
+void free_task_resources(task_t* task) {
     if (!task) return;
 
     // Free page table (if any)
@@ -327,7 +552,7 @@ static void free_task_resources(task_t* task) {
 }
 
 // Context switch to another task
-static void context_switch(task_t* next) {
+void context_switch(task_t* next) {
     if (!next || next == current_task) {
         return;
     }
